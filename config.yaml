@@ -1,0 +1,46 @@
+# NexusController v2.0 Configuration
+
+nexus:
+  version: "2.0.0"
+  node_id: "nexus-001"
+  data_dir: "./data"
+  log_level: "INFO"
+  debug: false
+
+network:
+  discovery_range: "10.0.0.0/24"
+  scan_interval: 300
+  timeout: 10
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+  enable_cors: true
+
+websocket:
+  host: "0.0.0.0"
+  port: 8765
+  auth_required: false
+
+federation:
+  enabled: false
+  port: 8081
+  bootstrap_nodes: []
+
+monitoring:
+  enabled: true
+  collection_interval: 30
+  retention_days: 30
+
+remediation:
+  enabled: true
+  auto_remediation: false
+
+plugins:
+  enabled: true
+  plugin_dir: "./plugins"
+
+security:
+  encryption_key_file: "./keys/nexus.key"
+  ssh_key_file: "~/.ssh/id_rsa"
+  known_hosts_file: "~/.ssh/known_hosts"
