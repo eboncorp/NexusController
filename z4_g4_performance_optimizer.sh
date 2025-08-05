@@ -1,12 +1,12 @@
 #!/bin/bash
 # HP Z4 G4 Performance Optimizer
-# Optimizes the media server for maximum performance with Xeon W-2245
+# Optimizes the media server for maximum performance with Xeon W-2125
 
 echo "🏎️  HP Z4 G4 PERFORMANCE OPTIMIZER"
 echo "=================================="
 echo "Hardware: HP Z4 G4 Workstation"
-echo "CPU: Intel Xeon W-2245 (8 cores, 16 threads)"
-echo "RAM: 48GB ECC DDR4"
+echo "CPU: Intel Xeon W-2125 (4 cores, 8 threads)"
+echo "RAM: 32GB DDR4"
 echo "Target: Media Server Optimization"
 echo ""
 
@@ -61,18 +61,18 @@ EOF
     echo "✅ CPU optimization complete"
 }
 
-# Memory Optimization for 48GB ECC RAM
+# Memory Optimization for 32GB RAM
 optimize_memory() {
-    echo "🧠 Optimizing Memory (48GB ECC DDR4)..."
+    echo "🧠 Optimizing Memory (32GB DDR4)..."
     
     # Optimize for media server workloads
     sudo tee -a /etc/sysctl.conf << 'EOF'
 
 # HP Z4 G4 Memory Optimization for Media Server
-# Optimized for 48GB ECC RAM with media workloads
+# Optimized for 32GB RAM with media workloads
 
 # Virtual memory settings
-vm.swappiness=10                    # Reduce swap usage with 48GB RAM
+vm.swappiness=10                    # Reduce swap usage with 32GB RAM
 vm.vfs_cache_pressure=50           # Balance file system cache
 vm.dirty_ratio=15                  # Allow more dirty pages with large RAM
 vm.dirty_background_ratio=5        # Start background writeback earlier
@@ -108,9 +108,9 @@ EOF
     echo "✅ Memory optimization complete"
 }
 
-# Storage Optimization (NVMe + potential RAID)
+# Storage Optimization (Dual NVMe: 100GB System + 2TB Media)
 optimize_storage() {
-    echo "💾 Optimizing Storage Performance..."
+    echo "💾 Optimizing Storage Performance (2x NVMe)..."
     
     # Detect NVMe drives
     nvme_drives=$(lsblk -d -o NAME,ROTA | awk '$2=="0" {print $1}' | grep -E '^nvme')
@@ -121,15 +121,24 @@ optimize_storage() {
         for drive in $nvme_drives; do
             echo "Optimizing /dev/$drive..."
             
-            # Set I/O scheduler for NVMe (none is usually best)
+            # Set I/O scheduler for NVMe (none is usually best for media workloads)
             echo 'none' | sudo tee /sys/block/$drive/queue/scheduler > /dev/null
             
-            # Optimize queue depth
+            # Optimize queue depth for media streaming
             echo '32' | sudo tee /sys/block/$drive/queue/nr_requests > /dev/null
             
-            # Disable NCQ for better latency (optional)
-            # echo '1' | sudo tee /sys/block/$drive/queue/nomerges > /dev/null
+            # Read-ahead optimization for large media files
+            echo '8192' | sudo tee /sys/block/$drive/queue/read_ahead_kb > /dev/null
         done
+        
+        # Optimize media storage mount specifically
+        if mountpoint -q /mnt/media; then
+            echo "Optimizing media storage mount (/mnt/media)..."
+            # Check if noatime is already set
+            if ! mount | grep /mnt/media | grep -q noatime; then
+                echo "Consider remounting /mnt/media with noatime option for better performance"
+            fi
+        fi
     fi
     
     # Optimize mount options for media storage
@@ -194,8 +203,8 @@ LimitNPROC=1048576
 LimitCORE=infinity
 TasksMax=infinity
 
-# Optimize for Xeon W-2245 (8 cores)
-Environment="GOMAXPROCS=8"
+# Optimize for Xeon W-2125 (4 cores)
+Environment="GOMAXPROCS=4"
 EOF
 
     # Restart Docker with new settings
@@ -240,7 +249,7 @@ optimize_media_services() {
 version: '3.8'
 
 # Optimized Docker Compose for HP Z4 G4 Media Server
-# Xeon W-2245 (8 cores/16 threads), 48GB ECC RAM
+# Xeon W-2125 (4 cores/8 threads), 32GB RAM
 
 services:
   nexuscontroller:
@@ -252,11 +261,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.0'        # 25% of Xeon capacity
-          memory: 4G         # Reasonable for 48GB system
+          cpus: '1.0'        # 25% of Xeon capacity
+          memory: 3G         # Reasonable for 32GB system
         reservations:
-          cpus: '1.0'
-          memory: 2G
+          cpus: '0.5'
+          memory: 1.5G
     networks:
       - media_network
     healthcheck:
@@ -274,17 +283,17 @@ services:
     volumes:
       - jellyfin_config:/config
       - jellyfin_cache:/cache
-      - /path/to/media:/media:ro
+      - /mnt/media:/media:ro
     environment:
       - JELLYFIN_PublishedServerUrl=http://10.0.0.29:8096
     deploy:
       resources:
         limits:
-          cpus: '4.0'        # 50% of Xeon for transcoding
-          memory: 8G         # More RAM for transcoding cache
+          cpus: '2.0'        # 50% of Xeon for transcoding
+          memory: 6G         # More RAM for transcoding cache
         reservations:
-          cpus: '2.0'
-          memory: 4G
+          cpus: '1.0'
+          memory: 3G
     devices:
       - /dev/dri:/dev/dri   # Hardware acceleration if available
     networks:
@@ -503,10 +512,10 @@ main() {
     echo "=================================="
     echo ""
     echo "✅ Applied optimizations:"
-    echo "  • CPU: Performance governor, Turbo Boost enabled"
-    echo "  • Memory: Optimized for 48GB ECC RAM + media workloads"
-    echo "  • Storage: NVMe optimization, TRIM enabled"
-    echo "  • Docker: Performance tuning for Xeon W-2245"
+    echo "  • CPU: Performance governor, Turbo Boost enabled (W-2125)"
+    echo "  • Memory: Optimized for 32GB RAM + media workloads"
+    echo "  • Storage: Dual NVMe optimization (2TB media storage)"
+    echo "  • Docker: Performance tuning for Xeon W-2125 (4 cores)"
     echo "  • Network: Enhanced buffer sizes and TCP optimization"
     echo "  • Media Services: Resource allocation optimized"
     echo "  • Security: fail2ban configured for media server"

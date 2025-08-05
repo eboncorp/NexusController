@@ -65,7 +65,7 @@ sudo ufw deny 8545/tcp comment 'Block Ethereum RPC'
 ## Phase 2: Hardware-Optimized Performance (Both Systems)
 
 ### ⚡ HP Z4 G4 Server Optimization (Primary Target)
-Your media server specs: Xeon W-2245 (8-core/16-thread), 48GB ECC RAM, Enterprise NVMe
+Your media server specs: Xeon W-2125 @ 4.00GHz (4-core/8-thread), 32GB RAM, Dual NVMe (2TB media)
 
 ### 💻 Dell Latitude 3520 Development Setup
 Your workstation specs: Intel Celeron 6305 (2-core), 16GB RAM, 512GB NVMe
@@ -108,9 +108,9 @@ services:
 Your Z4 G4 is already deployed with Docker - now optimizing with Proxmox:
 
 **Current Z4 G4 Hardware (Already Deployed):**
-- HP Z4 G4 @ 10.0.0.29 + Xeon W-2245 (8-core/16-thread)
-- 48GB ECC RAM (Ready for 128GB upgrade)
-- Enterprise NVMe + potential RAID expansion
+- HP Z4 G4 @ 10.0.0.29 + Xeon W-2125 @ 4.00GHz (4-core/8-thread)
+- 32GB DDR4 RAM
+- Dual NVMe: 100GB system drive + 2TB media storage
 - Currently running: Docker, NexusController, Jellyfin, Home Assistant
 
 **Proxmox Migration Path (Zero Downtime):**
