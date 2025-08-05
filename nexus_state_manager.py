@@ -31,11 +31,586 @@ from pathlib import Path
 import copy
 import sqlite3
 import pickle
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 import weakref
+import zlib
+import struct
 
 # Import event system
 from nexus_event_system import Event, EventType, EventBus
+
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+try:
+    import memcache
+    MEMCACHED_AVAILABLE = True
+except ImportError:
+    MEMCACHED_AVAILABLE = False
+
+class CacheLevel(Enum):
+    """Cache level hierarchy"""
+    L1 = "l1_memory"      # In-memory cache
+    L2 = "l2_compressed"  # Compressed in-memory cache
+    L3 = "l3_redis"       # Redis distributed cache
+    L4 = "l4_memcached"   # Memcached distributed cache
+    L5 = "l5_disk"        # Disk-based cache
+
+@dataclass
+class CacheEntry:
+    """Advanced cache entry with metadata"""
+    key: str
+    value: Any
+    created_at: datetime = field(default_factory=datetime.now)
+    last_accessed: datetime = field(default_factory=datetime.now)
+    access_count: int = 0
+    ttl_seconds: Optional[int] = None
+    compressed: bool = False
+    size_bytes: int = 0
+    cache_level: CacheLevel = CacheLevel.L1
+    tags: Set[str] = field(default_factory=set)
+    
+    def is_expired(self) -> bool:
+        """Check if cache entry has expired"""
+        if not self.ttl_seconds:
+            return False
+        return datetime.now() > self.created_at + timedelta(seconds=self.ttl_seconds)
+    
+    def update_access(self):
+        """Update access statistics"""
+        self.last_accessed = datetime.now()
+        self.access_count += 1
+
+class AdvancedCache:
+    """Multi-level adaptive cache with compression and distributed support"""
+    
+    def __init__(self, 
+                 max_memory_size: int = 100 * 1024 * 1024,  # 100MB
+                 redis_url: str = None,
+                 memcached_servers: List[str] = None,
+                 compression_threshold: int = 1024,  # Compress objects > 1KB
+                 default_ttl: int = 3600):  # 1 hour default TTL
+        
+        self.max_memory_size = max_memory_size
+        self.compression_threshold = compression_threshold
+        self.default_ttl = default_ttl
+        
+        # L1 Cache: In-memory cache with LRU eviction
+        self.l1_cache: OrderedDict[str, CacheEntry] = OrderedDict()
+        self.l1_size = 0
+        
+        # L2 Cache: Compressed in-memory cache
+        self.l2_cache: OrderedDict[str, CacheEntry] = OrderedDict()
+        self.l2_size = 0
+        
+        # Distributed caches
+        self.redis_client = None
+        self.memcached_client = None
+        
+        # Cache statistics
+        self.stats = {
+            'l1_hits': 0, 'l1_misses': 0,
+            'l2_hits': 0, 'l2_misses': 0,
+            'l3_hits': 0, 'l3_misses': 0,
+            'l4_hits': 0, 'l4_misses': 0,
+            'evictions': 0, 'compressions': 0,
+            'total_requests': 0
+        }
+        
+        # Cache locks for thread safety
+        self.l1_lock = threading.RLock()
+        self.l2_lock = threading.RLock()
+        
+        # Setup distributed caches
+        self._setup_redis(redis_url)
+        self._setup_memcached(memcached_servers)
+        
+        # Background cleanup task
+        self._cleanup_task = None
+        self._running = False
+        
+        logging.info(f"Advanced cache initialized with {max_memory_size/1024/1024:.1f}MB memory limit")
+    
+    def _setup_redis(self, redis_url: str):
+        """Setup Redis connection"""
+        if redis_url and REDIS_AVAILABLE:
+            try:
+                self.redis_client = redis.from_url(redis_url, decode_responses=True)
+                # Test connection
+                self.redis_client.ping()
+                logging.info("Redis cache backend connected")
+            except Exception as e:
+                logging.warning(f"Failed to connect to Redis: {e}")
+                self.redis_client = None
+    
+    def _setup_memcached(self, servers: List[str]):
+        """Setup Memcached connection"""
+        if servers and MEMCACHED_AVAILABLE:
+            try:
+                self.memcached_client = memcache.Client(servers)
+                # Test connection
+                self.memcached_client.set("test", "ok", time=1)
+                logging.info("Memcached cache backend connected")
+            except Exception as e:
+                logging.warning(f"Failed to connect to Memcached: {e}")
+                self.memcached_client = None
+    
+    async def start(self):
+        """Start background cleanup task"""
+        self._running = True
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        logging.info("Advanced cache started")
+    
+    async def stop(self):
+        """Stop background tasks"""
+        self._running = False
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        logging.info("Advanced cache stopped")
+    
+    def _serialize_value(self, value: Any) -> bytes:
+        """Serialize value for caching"""
+        try:
+            if isinstance(value, (str, int, float, bool)):
+                return json.dumps(value).encode('utf-8')
+            else:
+                return pickle.dumps(value)
+        except Exception as e:
+            logging.error(f"Failed to serialize value: {e}")
+            return b""
+    
+    def _deserialize_value(self, data: bytes) -> Any:
+        """Deserialize cached value"""
+        try:
+            # Try JSON first for simple types
+            try:
+                return json.loads(data.decode('utf-8'))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Fall back to pickle
+                return pickle.loads(data)
+        except Exception as e:
+            logging.error(f"Failed to deserialize value: {e}")
+            return None
+    
+    def _compress_data(self, data: bytes) -> bytes:
+        """Compress data using zlib"""
+        if len(data) < self.compression_threshold:
+            return data
+        
+        try:
+            compressed = zlib.compress(data, level=6)
+            # Only use compression if it actually saves space
+            if len(compressed) < len(data) * 0.9:  # 10% minimum savings
+                self.stats['compressions'] += 1
+                return compressed
+            return data
+        except Exception as e:
+            logging.error(f"Compression failed: {e}")
+            return data
+    
+    def _decompress_data(self, data: bytes, compressed: bool) -> bytes:
+        """Decompress data if compressed"""
+        if not compressed:
+            return data
+        
+        try:
+            return zlib.decompress(data)
+        except Exception as e:
+            logging.error(f"Decompression failed: {e}")
+            return data
+    
+    async def get(self, key: str, tags: Set[str] = None) -> Optional[Any]:
+        """Get value from cache with multi-level lookup"""
+        self.stats['total_requests'] += 1
+        
+        # L1 Cache check
+        with self.l1_lock:
+            if key in self.l1_cache:
+                entry = self.l1_cache[key]
+                if not entry.is_expired():
+                    # Move to end (most recently used)
+                    self.l1_cache.move_to_end(key)
+                    entry.update_access()
+                    self.stats['l1_hits'] += 1
+                    return entry.value
+                else:
+                    # Remove expired entry
+                    del self.l1_cache[key]
+                    self.l1_size -= entry.size_bytes
+        
+        self.stats['l1_misses'] += 1
+        
+        # L2 Cache check
+        with self.l2_lock:
+            if key in self.l2_cache:
+                entry = self.l2_cache[key]
+                if not entry.is_expired():
+                    # Decompress and promote to L1
+                    serialized_data = self._deserialize_value(entry.value)
+                    decompressed_data = self._decompress_data(serialized_data, entry.compressed)
+                    actual_value = self._deserialize_value(decompressed_data)
+                    
+                    # Move to end (most recently used)
+                    self.l2_cache.move_to_end(key)
+                    entry.update_access()
+                    
+                    # Promote to L1 if frequently accessed
+                    if entry.access_count > 3:
+                        await self._promote_to_l1(key, actual_value, entry.ttl_seconds, tags or entry.tags)
+                    
+                    self.stats['l2_hits'] += 1
+                    return actual_value
+                else:
+                    # Remove expired entry
+                    del self.l2_cache[key]
+                    self.l2_size -= entry.size_bytes
+        
+        self.stats['l2_misses'] += 1
+        
+        # L3 Cache check (Redis)
+        if self.redis_client:
+            try:
+                cached_data = self.redis_client.get(f"nexus:cache:{key}")
+                if cached_data:
+                    # Deserialize metadata and value
+                    metadata_size = struct.unpack('I', cached_data[:4])[0]
+                    metadata = json.loads(cached_data[4:4+metadata_size])
+                    value_data = cached_data[4+metadata_size:]
+                    
+                    # Check expiration
+                    created_at = datetime.fromisoformat(metadata['created_at'])
+                    ttl = metadata.get('ttl_seconds')
+                    if ttl and datetime.now() > created_at + timedelta(seconds=ttl):
+                        self.redis_client.delete(f"nexus:cache:{key}")
+                    else:
+                        # Deserialize value
+                        decompressed_data = self._decompress_data(value_data, metadata['compressed'])
+                        actual_value = self._deserialize_value(decompressed_data)
+                        
+                        # Store in L2 cache
+                        await self._store_in_l2(key, actual_value, ttl, set(metadata.get('tags', [])))
+                        
+                        self.stats['l3_hits'] += 1
+                        return actual_value
+            except Exception as e:
+                logging.error(f"Redis cache lookup failed: {e}")
+        
+        self.stats['l3_misses'] += 1
+        
+        # L4 Cache check (Memcached)
+        if self.memcached_client:
+            try:
+                cached_data = self.memcached_client.get(f"nexus:cache:{key}")
+                if cached_data:
+                    # Deserialize
+                    metadata, value_data = cached_data
+                    
+                    # Check expiration (Memcached handles TTL automatically)
+                    decompressed_data = self._decompress_data(value_data, metadata['compressed'])
+                    actual_value = self._deserialize_value(decompressed_data)
+                    
+                    # Store in L2 cache
+                    await self._store_in_l2(key, actual_value, metadata.get('ttl_seconds'), set(metadata.get('tags', [])))
+                    
+                    self.stats['l4_hits'] += 1
+                    return actual_value
+            except Exception as e:
+                logging.error(f"Memcached cache lookup failed: {e}")
+        
+        self.stats['l4_misses'] += 1
+        return None
+    
+    async def set(self, key: str, value: Any, ttl_seconds: int = None, tags: Set[str] = None) -> bool:
+        """Set value in cache with intelligent placement"""
+        if ttl_seconds is None:
+            ttl_seconds = self.default_ttl
+        
+        if tags is None:
+            tags = set()
+        
+        # Serialize value
+        serialized_data = self._serialize_value(value)
+        value_size = len(serialized_data)
+        
+        # Determine best cache level based on size and access patterns
+        if value_size < 1024:  # Small values go to L1
+            return await self._store_in_l1(key, value, ttl_seconds, tags)
+        elif value_size < 10 * 1024:  # Medium values go to L2 with compression
+            return await self._store_in_l2(key, value, ttl_seconds, tags)
+        else:  # Large values go to distributed cache
+            return await self._store_in_distributed(key, value, ttl_seconds, tags)
+    
+    async def _store_in_l1(self, key: str, value: Any, ttl_seconds: int, tags: Set[str]) -> bool:
+        """Store value in L1 cache"""
+        serialized_data = self._serialize_value(value)
+        value_size = len(serialized_data)
+        
+        with self.l1_lock:
+            # Evict if necessary
+            while self.l1_size + value_size > self.max_memory_size // 2:  # L1 gets half of memory
+                if not self.l1_cache:
+                    break
+                oldest_key, oldest_entry = self.l1_cache.popitem(last=False)
+                self.l1_size -= oldest_entry.size_bytes
+                self.stats['evictions'] += 1
+                
+                # Demote to L2 if still valuable
+                if oldest_entry.access_count > 1:
+                    await self._store_in_l2(oldest_key, oldest_entry.value, oldest_entry.ttl_seconds, oldest_entry.tags)
+            
+            # Store new entry
+            entry = CacheEntry(
+                key=key,
+                value=value,
+                ttl_seconds=ttl_seconds,
+                size_bytes=value_size,
+                cache_level=CacheLevel.L1,
+                tags=tags
+            )
+            
+            self.l1_cache[key] = entry
+            self.l1_size += value_size
+            
+        return True
+    
+    async def _store_in_l2(self, key: str, value: Any, ttl_seconds: int, tags: Set[str]) -> bool:
+        """Store value in L2 cache with compression"""
+        serialized_data = self._serialize_value(value)
+        compressed_data = self._compress_data(serialized_data)
+        compressed = len(compressed_data) < len(serialized_data)
+        value_size = len(compressed_data)
+        
+        with self.l2_lock:
+            # Evict if necessary
+            while self.l2_size + value_size > self.max_memory_size // 2:  # L2 gets half of memory
+                if not self.l2_cache:
+                    break
+                oldest_key, oldest_entry = self.l2_cache.popitem(last=False)
+                self.l2_size -= oldest_entry.size_bytes
+                self.stats['evictions'] += 1
+                
+                # Demote to distributed cache if still valuable
+                if oldest_entry.access_count > 1:
+                    actual_value = self._deserialize_value(
+                        self._decompress_data(oldest_entry.value, oldest_entry.compressed)
+                    )
+                    await self._store_in_distributed(oldest_key, actual_value, oldest_entry.ttl_seconds, oldest_entry.tags)
+            
+            # Store new entry
+            entry = CacheEntry(
+                key=key,
+                value=compressed_data,
+                ttl_seconds=ttl_seconds,
+                compressed=compressed,
+                size_bytes=value_size,
+                cache_level=CacheLevel.L2,
+                tags=tags
+            )
+            
+            self.l2_cache[key] = entry
+            self.l2_size += value_size
+            
+        return True
+    
+    async def _store_in_distributed(self, key: str, value: Any, ttl_seconds: int, tags: Set[str]) -> bool:
+        """Store value in distributed cache (Redis/Memcached)"""
+        serialized_data = self._serialize_value(value)
+        compressed_data = self._compress_data(serialized_data)
+        compressed = len(compressed_data) < len(serialized_data)
+        
+        metadata = {
+            'created_at': datetime.now().isoformat(),
+            'ttl_seconds': ttl_seconds,
+            'compressed': compressed,
+            'tags': list(tags)
+        }
+        
+        # Try Redis first
+        if self.redis_client:
+            try:
+                # Pack metadata and value
+                metadata_bytes = json.dumps(metadata).encode('utf-8')
+                packed_data = struct.pack('I', len(metadata_bytes)) + metadata_bytes + compressed_data
+                
+                self.redis_client.setex(f"nexus:cache:{key}", ttl_seconds, packed_data)
+                return True
+            except Exception as e:
+                logging.error(f"Redis cache store failed: {e}")
+        
+        # Try Memcached as fallback
+        if self.memcached_client:
+            try:
+                cached_data = (metadata, compressed_data)
+                self.memcached_client.set(f"nexus:cache:{key}", cached_data, time=ttl_seconds)
+                return True
+            except Exception as e:
+                logging.error(f"Memcached cache store failed: {e}")
+        
+        return False
+    
+    async def _promote_to_l1(self, key: str, value: Any, ttl_seconds: int, tags: Set[str]):
+        """Promote frequently accessed item to L1 cache"""
+        await self._store_in_l1(key, value, ttl_seconds, tags)
+    
+    async def delete(self, key: str) -> bool:
+        """Delete key from all cache levels"""
+        deleted = False
+        
+        # Remove from L1
+        with self.l1_lock:
+            if key in self.l1_cache:
+                entry = self.l1_cache.pop(key)
+                self.l1_size -= entry.size_bytes
+                deleted = True
+        
+        # Remove from L2
+        with self.l2_lock:
+            if key in self.l2_cache:
+                entry = self.l2_cache.pop(key)
+                self.l2_size -= entry.size_bytes
+                deleted = True
+        
+        # Remove from Redis
+        if self.redis_client:
+            try:
+                self.redis_client.delete(f"nexus:cache:{key}")
+                deleted = True
+            except Exception as e:
+                logging.error(f"Redis cache delete failed: {e}")
+        
+        # Remove from Memcached
+        if self.memcached_client:
+            try:
+                self.memcached_client.delete(f"nexus:cache:{key}")
+                deleted = True
+            except Exception as e:
+                logging.error(f"Memcached cache delete failed: {e}")
+        
+        return deleted
+    
+    async def delete_by_tags(self, tags: Set[str]) -> int:
+        """Delete all cache entries matching any of the given tags"""
+        deleted_count = 0
+        
+        # L1 cache
+        with self.l1_lock:
+            keys_to_delete = []
+            for key, entry in self.l1_cache.items():
+                if entry.tags & tags:  # Intersection check
+                    keys_to_delete.append(key)
+            
+            for key in keys_to_delete:
+                entry = self.l1_cache.pop(key)
+                self.l1_size -= entry.size_bytes
+                deleted_count += 1
+        
+        # L2 cache
+        with self.l2_lock:
+            keys_to_delete = []
+            for key, entry in self.l2_cache.items():
+                if entry.tags & tags:  # Intersection check
+                    keys_to_delete.append(key)
+            
+            for key in keys_to_delete:
+                entry = self.l2_cache.pop(key)
+                self.l2_size -= entry.size_bytes
+                deleted_count += 1
+        
+        # For distributed caches, we'd need to implement tag indexing
+        # This is a simplified implementation
+        
+        return deleted_count
+    
+    async def clear(self):
+        """Clear all cache levels"""
+        with self.l1_lock:
+            self.l1_cache.clear()
+            self.l1_size = 0
+        
+        with self.l2_lock:
+            self.l2_cache.clear()
+            self.l2_size = 0
+        
+        if self.redis_client:
+            try:
+                # Delete all nexus cache keys
+                keys = self.redis_client.keys("nexus:cache:*")
+                if keys:
+                    self.redis_client.delete(*keys)
+            except Exception as e:
+                logging.error(f"Redis cache clear failed: {e}")
+        
+        if self.memcached_client:
+            try:
+                self.memcached_client.flush_all()
+            except Exception as e:
+                logging.error(f"Memcached cache clear failed: {e}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        total_hits = sum(self.stats[k] for k in self.stats if k.endswith('_hits'))
+        total_misses = sum(self.stats[k] for k in self.stats if k.endswith('_misses'))
+        hit_rate = total_hits / (total_hits + total_misses) if (total_hits + total_misses) > 0 else 0
+        
+        return {
+            **self.stats,
+            'hit_rate': hit_rate,
+            'l1_size_bytes': self.l1_size,
+            'l2_size_bytes': self.l2_size,
+            'l1_entries': len(self.l1_cache),
+            'l2_entries': len(self.l2_cache),
+            'memory_usage_mb': (self.l1_size + self.l2_size) / 1024 / 1024,
+            'redis_connected': self.redis_client is not None,
+            'memcached_connected': self.memcached_client is not None
+        }
+    
+    async def _cleanup_loop(self):
+        """Background task to clean up expired entries"""
+        while self._running:
+            try:
+                await self._cleanup_expired_entries()
+                await asyncio.sleep(300)  # Run every 5 minutes
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Cache cleanup failed: {e}")
+                await asyncio.sleep(60)
+    
+    async def _cleanup_expired_entries(self):
+        """Remove expired entries from memory caches"""
+        now = datetime.now()
+        
+        # Cleanup L1 cache
+        with self.l1_lock:
+            expired_keys = []
+            for key, entry in self.l1_cache.items():
+                if entry.is_expired():
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                entry = self.l1_cache.pop(key)
+                self.l1_size -= entry.size_bytes
+        
+        # Cleanup L2 cache
+        with self.l2_lock:
+            expired_keys = []
+            for key, entry in self.l2_cache.items():
+                if entry.is_expired():
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                entry = self.l2_cache.pop(key)
+                self.l2_size -= entry.size_bytes
+        
+        if expired_keys:
+            logging.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
 
 class ResourceType(Enum):
     """Types of infrastructure resources"""
@@ -1287,7 +1862,8 @@ class ConflictResolver:
 class EnterpriseStateManager:
     """Enterprise-grade infrastructure state management system"""
     
-    def __init__(self, backend: StateBackend, event_bus: EventBus = None, node_id: str = None):
+    def __init__(self, backend: StateBackend, event_bus: EventBus = None, node_id: str = None,
+                 cache_config: Dict[str, Any] = None):
         self.backend = backend
         self.event_bus = event_bus
         self.node_id = node_id or f"node_{uuid.uuid4().hex[:8]}"
@@ -1296,7 +1872,17 @@ class EnterpriseStateManager:
         self.drift_analyzer = DriftAnalyzer()
         self.conflict_resolver = ConflictResolver()
         
-        # In-memory state cache with sharding
+        # Advanced multi-level cache
+        cache_config = cache_config or {}
+        self.cache = AdvancedCache(
+            max_memory_size=cache_config.get('max_memory_size', 100 * 1024 * 1024),  # 100MB default
+            redis_url=cache_config.get('redis_url'),
+            memcached_servers=cache_config.get('memcached_servers'),
+            compression_threshold=cache_config.get('compression_threshold', 1024),
+            default_ttl=cache_config.get('default_ttl', 3600)
+        )
+        
+        # In-memory state cache with sharding (legacy, kept for compatibility)
         self.resources = {}  # resource_id -> Resource
         self.resource_shards = defaultdict(dict)  # shard_key -> {resource_id -> Resource}
         self.snapshots = {}  # snapshot_id -> StateSnapshot
@@ -1332,6 +1918,9 @@ class EnterpriseStateManager:
         """Start state management services"""
         self._running = True
         
+        # Start advanced cache
+        await self.cache.start()
+        
         # Load existing resources
         await self._load_all_resources()
         
@@ -1354,6 +1943,9 @@ class EnterpriseStateManager:
         
         # Wait for tasks to complete
         await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Stop advanced cache
+        await self.cache.stop()
         
         logging.info("Enterprise StateManager stopped")
     
@@ -1454,6 +2046,13 @@ class EnterpriseStateManager:
                     self.resources[resource_id] = resource
                     self.resource_shards[resource.shard_key][resource_id] = resource
                     
+                    # Update advanced cache
+                    cache_key = f"resource:{resource_id}"
+                    await self.cache.set(cache_key, resource, tags={'resource', resource_id, resource.resource_type.value})
+                    
+                    # Invalidate list caches
+                    await self.cache.delete_by_tags({'resource_list', resource.resource_type.value})
+                    
                     # Commit transaction
                     await self.backend.commit_transaction(transaction_id)
                     
@@ -1487,43 +2086,79 @@ class EnterpriseStateManager:
             raise
     
     async def get_resource(self, resource_id: str, use_cache: bool = True) -> Optional[Resource]:
-        """Get resource by ID with caching"""
+        """Get resource by ID with advanced multi-level caching"""
         if use_cache:
+            # Try advanced cache first
+            cache_key = f"resource:{resource_id}"
+            cached_resource = await self.cache.get(cache_key, tags={'resource', resource_id})
+            if cached_resource:
+                return copy.deepcopy(cached_resource)
+            
+            # Fallback to legacy cache
             with self.sync_lock:
                 resource = self.resources.get(resource_id)
                 if resource:
+                    # Store in advanced cache for future requests
+                    await self.cache.set(cache_key, resource, tags={'resource', resource_id, resource.resource_type.value})
                     return copy.deepcopy(resource)
         
         # Load from backend
         resource = await self.backend.load_resource(resource_id)
-        if resource and use_cache:
-            # Update cache
-            with self.sync_lock:
-                self.resources[resource_id] = resource
-                self.resource_shards[resource.shard_key][resource_id] = resource
+        if resource:
+            if use_cache:
+                # Update both caches
+                cache_key = f"resource:{resource_id}"
+                await self.cache.set(cache_key, resource, tags={'resource', resource_id, resource.resource_type.value})
+                
+                with self.sync_lock:
+                    self.resources[resource_id] = resource
+                    self.resource_shards[resource.shard_key][resource_id] = resource
         
         return resource
     
     async def list_resources(self, resource_type: ResourceType = None, 
                            shard_key: str = None, use_cache: bool = True) -> List[Resource]:
-        """List resources with filtering and caching"""
-        if use_cache and not shard_key:
-            # Use cache for non-shard-specific queries
-            with self.sync_lock:
-                resources = list(self.resources.values())
-                if resource_type:
-                    resources = [r for r in resources if r.resource_type == resource_type]
-                return [copy.deepcopy(r) for r in resources]
+        """List resources with filtering and advanced caching"""
+        if use_cache:
+            # Create cache key for this query
+            cache_key = f"list_resources:{resource_type.value if resource_type else 'all'}:{shard_key or 'all'}"
+            
+            # Try advanced cache first
+            cached_resources = await self.cache.get(cache_key, tags={'resource_list', resource_type.value if resource_type else 'all'})
+            if cached_resources:
+                return [copy.deepcopy(r) for r in cached_resources]
+            
+            # Fallback to legacy cache for non-shard-specific queries
+            if not shard_key:
+                with self.sync_lock:
+                    resources = list(self.resources.values())
+                    if resource_type:
+                        resources = [r for r in resources if r.resource_type == resource_type]
+                    
+                    # Store in advanced cache with shorter TTL for list queries
+                    await self.cache.set(cache_key, resources, ttl_seconds=300, 
+                                       tags={'resource_list', resource_type.value if resource_type else 'all'})
+                    return [copy.deepcopy(r) for r in resources]
         
         # Load from backend
         resources = await self.backend.list_resources(resource_type, shard_key)
         
         if use_cache:
-            # Update cache
+            # Update advanced cache
+            cache_key = f"list_resources:{resource_type.value if resource_type else 'all'}:{shard_key or 'all'}"
+            await self.cache.set(cache_key, resources, ttl_seconds=300,
+                               tags={'resource_list', resource_type.value if resource_type else 'all'})
+            
+            # Update legacy cache
             with self.sync_lock:
                 for resource in resources:
                     self.resources[resource.resource_id] = resource
                     self.resource_shards[resource.shard_key][resource.resource_id] = resource
+                    
+                    # Also cache individual resources
+                    resource_cache_key = f"resource:{resource.resource_id}"
+                    await self.cache.set(resource_cache_key, resource, 
+                                       tags={'resource', resource.resource_id, resource.resource_type.value})
         
         return resources
     
@@ -1547,6 +2182,13 @@ class EnterpriseStateManager:
                 del self.resources[resource_id]
                 if resource_id in self.resource_shards[resource.shard_key]:
                     del self.resource_shards[resource.shard_key][resource_id]
+                
+                # Remove from advanced cache
+                cache_key = f"resource:{resource_id}"
+                await self.cache.delete(cache_key)
+                
+                # Invalidate list caches
+                await self.cache.delete_by_tags({'resource_list', resource.resource_type.value})
                 
                 self.metrics['resources_managed'] -= 1
                 
@@ -1918,6 +2560,7 @@ class EnterpriseStateManager:
     def get_metrics(self) -> Dict[str, Any]:
         """Get state manager metrics and statistics"""
         with self.sync_lock:
+            cache_stats = self.cache.get_stats()
             return {
                 **self.metrics,
                 'cache_size': len(self.resources),
@@ -1925,7 +2568,8 @@ class EnterpriseStateManager:
                 'snapshots_cached': len(self.snapshots),
                 'last_sync_time': self.last_sync_time.isoformat(),
                 'node_id': self.node_id,
-                'uptime_seconds': (datetime.now() - datetime.now()).total_seconds()
+                'uptime_seconds': (datetime.now() - datetime.now()).total_seconds(),
+                'advanced_cache': cache_stats
             }
 
 def main():
