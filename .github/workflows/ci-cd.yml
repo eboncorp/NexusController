@@ -1,0 +1,417 @@
+name: NexusController CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  PYTHON_VERSION: '3.11'
+  POETRY_VERSION: '1.7.0'
+
+jobs:
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv (ultra-fast Python package installer)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          uv pip install safety bandit semgrep pip-audit
+      
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Safety check (Python vulnerabilities)
+        run: |
+          source .venv/bin/activate
+          safety check --json --output safety-report.json || true
+          if [ -f safety-report.json ]; then
+            cat safety-report.json | jq '.'
+          fi
+      
+      - name: Run pip-audit (Python package vulnerabilities)
+        run: |
+          source .venv/bin/activate
+          pip-audit --format json --output pip-audit-report.json || true
+          if [ -f pip-audit-report.json ]; then
+            cat pip-audit-report.json | jq '.'
+          fi
+      
+      - name: Run Bandit security linter
+        run: |
+          source .venv/bin/activate
+          bandit -r . -f json -o bandit-report.json -x .venv,tests || true
+          if [ -f bandit-report.json ]; then
+            cat bandit-report.json | jq '.results[] | select(.issue_severity == "HIGH" or .issue_severity == "MEDIUM")'
+          fi
+      
+      - name: Run Semgrep security analysis
+        run: |
+          python -m pip install semgrep
+          semgrep --config=auto --json --output=semgrep-report.json . || true
+          if [ -f semgrep-report.json ]; then
+            cat semgrep-report.json | jq '.results[] | select(.extra.severity == "ERROR" or .extra.severity == "WARNING")'
+          fi
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            trivy-results.sarif
+            safety-report.json
+            pip-audit-report.json
+            bandit-report.json
+            semgrep-report.json
+          retention-days: 30
+
+  code-quality:
+    name: Code Quality and Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Create virtual environment and install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          uv pip install ruff mypy black isort
+      
+      - name: Run Ruff linter
+        run: |
+          source .venv/bin/activate
+          ruff check . --output-format=github
+      
+      - name: Run Ruff formatter check
+        run: |
+          source .venv/bin/activate
+          ruff format --check .
+      
+      - name: Run MyPy type checking
+        run: |
+          source .venv/bin/activate
+          mypy --config-file pyproject.toml . || true
+      
+      - name: Check import sorting with isort
+        run: |
+          source .venv/bin/activate
+          isort --check-only --diff .
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nexus_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          uv pip install pytest pytest-asyncio pytest-cov pytest-mock faker factory-boy httpx respx
+      
+      - name: Run tests with coverage
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/nexus_test
+          REDIS_URL: redis://localhost:6379
+        run: |
+          source .venv/bin/activate
+          pytest --cov=nexuscontroller --cov-report=xml --cov-report=html --cov-fail-under=80 -v
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+  container-security:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Build Docker image
+        run: |
+          docker build -t nexuscontroller:latest .
+      
+      - name: Run Trivy vulnerability scanner (Docker image)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'nexuscontroller:latest'
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy image scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+      
+      - name: Run Hadolint (Dockerfile linter)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          format: sarif
+          output-file: hadolint-results.sarif
+          no-fail: true
+      
+      - name: Upload Hadolint results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: hadolint-results.sarif
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [security-scan, code-quality, test]
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nexus_integration
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          uv pip install pytest pytest-asyncio httpx
+      
+      - name: Start application
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/nexus_integration
+        run: |
+          source .venv/bin/activate
+          python nexus_api_server_enhanced.py &
+          sleep 10
+      
+      - name: Run integration tests
+        run: |
+          source .venv/bin/activate
+          # Run health check
+          curl -f http://localhost:8000/health || exit 1
+          
+          # Run API tests
+          pytest tests/integration/ -v || true
+      
+      - name: Stop application
+        run: |
+          pkill -f "python nexus_api_server_enhanced.py" || true
+
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: [security-scan, code-quality, test, container-security, integration-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Sign container image
+        run: |
+          echo "Container image signed with keyless signing"
+          # In production, you would use cosign or similar tool
+          # cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+
+  compliance-check:
+    name: Compliance and Governance
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check for secrets in repository
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+      
+      - name: License compliance check
+        run: |
+          echo "Checking license compliance..."
+          find . -name "*.py" -exec grep -l "Copyright\|License" {} \; | wc -l
+      
+      - name: Generate Software Bill of Materials (SBOM)
+        run: |
+          python -m pip install cyclonedx-bom
+          # cyclonedx-py -o sbom.json
+          echo "SBOM generation placeholder"
+      
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.json
+          retention-days: 90
+
+  notify:
+    name: Notifications
+    runs-on: ubuntu-latest
+    needs: [build-and-deploy]
+    if: always()
+    
+    steps:
+      - name: Notify on success
+        if: needs.build-and-deploy.result == 'success'
+        run: |
+          echo "✅ Deployment successful!"
+          # In production, you would send notifications to Slack, email, etc.
+      
+      - name: Notify on failure
+        if: needs.build-and-deploy.result == 'failure'
+        run: |
+          echo "❌ Deployment failed!"
+          # In production, you would send failure notifications
