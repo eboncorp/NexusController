@@ -2,6 +2,19 @@
 name = "nexuscontroller"
 version = "2.0.0"
 description = "Enterprise Infrastructure Management Platform"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "EbonCorp"}]
+keywords = ["infrastructure", "automation", "cloud", "management", "monitoring"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Systems Administration",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.104.0",
@@ -95,7 +108,7 @@ strict_equality = true
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src"]
 asyncio_mode = "auto"
 addopts = """
     -ra
@@ -109,7 +122,7 @@ addopts = """
 """
 
 [tool.coverage.run]
-source = ["nexuscontroller"]
+source = ["src/nexuscontroller"]
 omit = ["*/tests/*", "*/test_*.py", "*/__pycache__/*"]
 
 [tool.coverage.report]
@@ -122,6 +135,17 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "class .*\\bProtocol\\):",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nexuscontroller*"]
+namespaces = false
+
+[project.scripts]
+nexuscontroller = "nexuscontroller.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]

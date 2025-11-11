@@ -16,8 +16,8 @@ except ImportError:
     FASTAPI_AVAILABLE = False
 
 try:
-    from nexus_api_server_enhanced import app
-    from nexus_auth_security import security_service, api_key_service, Role, Permission
+    from nexuscontroller.api.server import app
+    from nexuscontroller.security.auth import security_service, api_key_service, Role, Permission
     NEXUS_MODULES_AVAILABLE = True
 except ImportError:
     NEXUS_MODULES_AVAILABLE = False
@@ -57,7 +57,7 @@ class TestAuthenticationEndpoints:
              patch.object(db_manager, 'handle_successful_login') as mock_success_login:
             
             # Create mock user object
-            from nexus_database_manager import NexusUser
+            from nexuscontroller.data.database import NexusUser
             mock_user = NexusUser(**sample_user_data)
             mock_get_user.return_value = mock_user
             
@@ -103,7 +103,7 @@ class TestAuthenticationEndpoints:
     async def test_login_with_locked_account(self, api_client, db_manager, sample_user_data):
         """Test login with locked account"""
         with patch.object(db_manager, 'get_user_by_username') as mock_get_user:
-            from nexus_database_manager import NexusUser
+            from nexuscontroller.data.database import NexusUser
             
             # Create locked user
             locked_user_data = sample_user_data.copy()
@@ -127,7 +127,7 @@ class TestAuthenticationEndpoints:
     async def test_login_with_mfa_required(self, api_client, db_manager, sample_user_data):
         """Test login with MFA required but not provided"""
         with patch.object(db_manager, 'get_user_by_username') as mock_get_user:
-            from nexus_database_manager import NexusUser
+            from nexuscontroller.data.database import NexusUser
             
             # Create MFA-enabled user
             mfa_user_data = sample_user_data.copy()
@@ -177,7 +177,7 @@ class TestAuthenticationEndpoints:
         }
         
         with patch('nexus_database_manager.db_manager.get_user_by_username') as mock_get_user:
-            from nexus_database_manager import NexusUser
+            from nexuscontroller.data.database import NexusUser
             mock_user = NexusUser(
                 username=test_user.username,
                 email=test_user.email,

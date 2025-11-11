@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
 try:
-    from nexus_auth_security import (
+    from nexuscontroller.security.auth import (
         SecurityService, SecurityConfig, UserModel, Role, Permission,
         APIKeyService, security_headers_middleware
     )

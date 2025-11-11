@@ -20,12 +20,12 @@ os.environ.setdefault("LOG_LEVEL", "DEBUG")
 
 # Import modules to test
 try:
-    from nexus_auth_security import SecurityService, UserModel, Role, Permission
-    from nexus_database_manager import DatabaseManager, DatabaseConfig
-    from nexus_event_system_enhanced import EnhancedEventBus, EventBusConfig, EventModel, EventType
-    from nexus_plugin_system_enhanced import EnhancedPluginManager
-    from nexus_circuit_breaker import CircuitBreaker, CircuitBreakerConfig
-    from nexus_observability import ObservabilityManager, ObservabilityConfig
+    from nexuscontroller.security.auth import SecurityService, UserModel, Role, Permission
+    from nexuscontroller.data.database import DatabaseManager, DatabaseConfig
+    from nexuscontroller.core.event_system import EnhancedEventBus, EventBusConfig, EventModel, EventType
+    from nexuscontroller.plugins.plugin_system import EnhancedPluginManager
+    from nexuscontroller.reliability.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+    from nexuscontroller.infrastructure.observability import ObservabilityManager, ObservabilityConfig
     NEXUS_MODULES_AVAILABLE = True
 except ImportError:
     NEXUS_MODULES_AVAILABLE = False
@@ -123,7 +123,7 @@ def security_service() -> SecurityService:
     if not NEXUS_MODULES_AVAILABLE:
         pytest.skip("Nexus modules not available")
     
-    from nexus_auth_security import SecurityConfig
+    from nexuscontroller.security.auth import SecurityConfig
     config = SecurityConfig(
         jwt_secret_key="test-secret-key-for-testing-only",
         access_token_expire_minutes=15,
@@ -240,7 +240,7 @@ async def api_client() -> AsyncGenerator[AsyncClient, None]:
     if not (FASTAPI_AVAILABLE and NEXUS_MODULES_AVAILABLE):
         pytest.skip("FastAPI or Nexus modules not available")
     
-    from nexus_api_server_enhanced import app
+    from nexuscontroller.api.server import app
     
     async with AsyncClient(app=app, base_url="http://test") as client:
         yield client

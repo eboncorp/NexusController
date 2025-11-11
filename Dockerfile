@@ -90,7 +90,7 @@ RUN chmod +x scripts/*.sh || true
 USER nexus
 
 # Set environment variables
-ENV PYTHONPATH=/app \
+ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
@@ -111,8 +111,8 @@ HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
 # Use dumb-init as PID 1 for proper signal handling
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 
-# Default command - run enhanced API server
-CMD ["python", "nexus_api_server_enhanced.py"]
+# Default command - run enhanced API server as module
+CMD ["python", "-m", "nexuscontroller"]
 
 #########################################
 # Development Stage

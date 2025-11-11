@@ -9,7 +9,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 try:
-    from nexus_database_manager import (
+    from nexuscontroller.data.database import (
         DatabaseManager, DatabaseConfig, NexusResource, NexusUser, 
         NexusSession, NexusAuditLog, QueryMetrics
     )
